@@ -4,7 +4,286 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Dash Financiero</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js">
+// ============================================================
+// PLAN DE ACCIÓN
+// ============================================================
+const DEBT_COLORS = ['#e05c6a','#3b82f6','#2ecc8a','#f5a623','#aa88dd','#5b8fcc','#f09595','#7dd4aa'];
+let selectedDebtColor = DEBT_COLORS[0];
+let editingDebtIdx = null;
+let planStrategy = 'snowball';
+
+const DEFAULT_DEBTS = [
+  { name:'Didi', balance:1500, paid:0, minPay:300, interest:0, color:DEBT_COLORS[0] },
+  { name:'Plata', balance:2000, paid:0, minPay:400, interest:0, color:DEBT_COLORS[1] },
+  { name:'Stori', balance:4000, paid:0, minPay:500, interest:0, color:DEBT_COLORS[2] },
+];
+let debts = S.get('fin_debts', DEFAULT_DEBTS);
+
+function buildDebtColorSwatches() {
+  const wrap = document.getElementById('debt-color-swatches');
+  if (!wrap) return;
+  wrap.innerHTML = DEBT_COLORS.map((c,i) =>
+    `<div onclick="selectDebtColor('${c}')" style="width:24px;height:24px;border-radius:50%;background:${c};cursor:pointer;border:3px solid ${c===selectedDebtColor?'white':'transparent'};box-shadow:${c===selectedDebtColor?'0 0 0 2px '+c:'none'};transition:all .15s;"></div>`
+  ).join('');
+}
+
+function selectDebtColor(c) {
+  selectedDebtColor = c;
+  buildDebtColorSwatches();
+  updateDebtPreview();
+}
+
+function updateDebtPreview() {
+  const name = document.getElementById('debt-name')?.value || 'Nombre';
+  const balance = parseFloat(document.getElementById('debt-balance')?.value) || 0;
+  const paid = parseFloat(document.getElementById('debt-paid')?.value) || 0;
+  const pct = balance > 0 ? Math.min(100, Math.round((paid/balance)*100)) : 0;
+  document.getElementById('dp-name').textContent = name || 'Nombre';
+  document.getElementById('dp-balance').textContent = '$' + balance.toLocaleString('es-MX');
+  document.getElementById('dp-bar').style.width = pct + '%';
+  document.getElementById('dp-bar').style.background = selectedDebtColor;
+  document.getElementById('dp-paid-lbl').textContent = '$' + paid.toLocaleString('es-MX') + ' pagado';
+  document.getElementById('dp-pct').textContent = pct + '%';
+}
+
+function openDebtModal(idx = null) {
+  editingDebtIdx = idx;
+  const isEdit = idx !== null;
+  document.getElementById('debt-modal-title').textContent = isEdit ? 'Editar deuda' : 'Nueva deuda';
+  document.getElementById('debt-save-btn').textContent = isEdit ? 'Guardar' : 'Agregar';
+  if (isEdit) {
+    const d = debts[idx];
+    document.getElementById('debt-name').value = d.name;
+    document.getElementById('debt-balance').value = d.balance;
+    document.getElementById('debt-paid').value = d.paid;
+    document.getElementById('debt-minpay').value = d.minPay;
+    document.getElementById('debt-interest').value = d.interest || 0;
+    selectedDebtColor = d.color || DEBT_COLORS[0];
+  } else {
+    document.getElementById('debt-name').value = '';
+    document.getElementById('debt-balance').value = '';
+    document.getElementById('debt-paid').value = '';
+    document.getElementById('debt-minpay').value = '';
+    document.getElementById('debt-interest').value = '';
+    selectedDebtColor = DEBT_COLORS[debts.length % DEBT_COLORS.length];
+  }
+  buildDebtColorSwatches();
+  updateDebtPreview();
+  document.getElementById('modal-debt').classList.add('open');
+}
+
+function saveDebt() {
+  const name = document.getElementById('debt-name').value.trim();
+  const balance = parseFloat(document.getElementById('debt-balance').value) || 0;
+  const paid = parseFloat(document.getElementById('debt-paid').value) || 0;
+  const minPay = parseFloat(document.getElementById('debt-minpay').value) || 0;
+  const interest = parseFloat(document.getElementById('debt-interest').value) || 0;
+  if (!name || balance <= 0) { alert('Ingresa nombre y saldo'); return; }
+  const debt = { name, balance, paid, minPay, interest, color: selectedDebtColor };
+  if (editingDebtIdx !== null) { debts[editingDebtIdx] = debt; editingDebtIdx = null; }
+  else debts.push(debt);
+  S.set('fin_debts', debts);
+  closeModal('debt');
+  renderPlanView();
+}
+
+function deleteDebt(idx) {
+  if (!confirm('¿Eliminar "' + debts[idx].name + '"?')) return;
+  debts.splice(idx, 1);
+  S.set('fin_debts', debts);
+  renderPlanView();
+}
+
+function setStrategy(s) {
+  planStrategy = s;
+  const sb = document.getElementById('strat-snowball');
+  const av = document.getElementById('strat-avalanche');
+  if (s === 'snowball') {
+    sb.style.background='var(--accent)'; sb.style.color='white'; sb.style.fontWeight='700';
+    av.style.background='transparent'; av.style.color='var(--text2)'; av.style.fontWeight='500';
+  } else {
+    av.style.background='var(--accent)'; av.style.color='white'; av.style.fontWeight='700';
+    sb.style.background='transparent'; sb.style.color='var(--text2)'; sb.style.fontWeight='500';
+  }
+  runPlanProjection();
+}
+
+function runPlanProjection() {
+  if (!debts.length) return;
+  const monthlyBudget = parseFloat(document.getElementById('plan-monthly-budget')?.value) || 0;
+
+  // Work on copies with remaining balance
+  let working = debts.map((d,i) => ({
+    idx: i,
+    name: d.name,
+    remaining: Math.max(0, d.balance - d.paid),
+    minPay: d.minPay || 0,
+    interest: (d.interest || 0) / 100,
+    color: d.color,
+    paidOff: false,
+    monthsPaidOff: null,
+  }));
+
+  // Sort by strategy
+  if (planStrategy === 'snowball') {
+    working.sort((a,b) => a.remaining - b.remaining);
+  } else {
+    working.sort((a,b) => b.interest - a.interest);
+  }
+
+  let month = 0;
+  const maxMonths = 240; // 20 years cap
+  while (working.some(d => !d.paidOff) && month < maxMonths) {
+    month++;
+    // Available extra after minimums
+    let totalMin = working.filter(d=>!d.paidOff).reduce((s,d)=>s+d.minPay, 0);
+    let extra = Math.max(0, monthlyBudget - totalMin);
+
+    for (let d of working) {
+      if (d.paidOff) continue;
+      // Apply interest
+      d.remaining += d.remaining * d.interest;
+      // Pay minimum
+      let pay = Math.min(d.minPay, d.remaining);
+      d.remaining -= pay;
+      if (d.remaining <= 0) { d.remaining = 0; d.paidOff = true; d.monthsPaidOff = month; continue; }
+    }
+    // Apply extra to priority debt (first not paid off in sorted order)
+    const priority = working.find(d => !d.paidOff);
+    if (priority && extra > 0) {
+      priority.remaining = Math.max(0, priority.remaining - extra);
+      if (priority.remaining === 0) { priority.paidOff = true; priority.monthsPaidOff = month; }
+    }
+  }
+
+  // Update UI
+  const totalDebt = debts.reduce((s,d) => s + d.balance, 0);
+  const totalPaid = debts.reduce((s,d) => s + d.paid, 0);
+  const totalRemaining = debts.reduce((s,d) => s + Math.max(0, d.balance - d.paid), 0);
+
+  document.getElementById('plan-total-debt').textContent = '$' + totalDebt.toLocaleString('es-MX');
+  document.getElementById('plan-total-paid').textContent = '$' + totalPaid.toLocaleString('es-MX');
+  document.getElementById('plan-total-remaining').textContent = '$' + totalRemaining.toLocaleString('es-MX');
+
+  const maxMonth = Math.max(...working.map(d => d.monthsPaidOff || month));
+  const totalEl = document.getElementById('plan-months-total');
+  if (maxMonth >= maxMonths) {
+    totalEl.textContent = '+20 años';
+    totalEl.style.color = 'var(--red)';
+  } else if (maxMonth === 0) {
+    totalEl.textContent = '¡Listo!';
+    totalEl.style.color = 'var(--green)';
+  } else {
+    const yrs = Math.floor(maxMonth / 12);
+    const mos = maxMonth % 12;
+    totalEl.textContent = yrs > 0 ? `${yrs}a ${mos}m` : `${mos} mes${mos!==1?'es':''}`;
+    totalEl.style.color = maxMonth <= 6 ? 'var(--green)' : maxMonth <= 18 ? '#f5a623' : 'var(--red)';
+  }
+
+  // Strategy tip
+  const tip = document.getElementById('plan-strategy-tip');
+  const tipText = document.getElementById('plan-strategy-text');
+  if (planStrategy === 'snowball') {
+    tipText.innerHTML = '<b>❄️ Snowball:</b> Pagas primero la deuda más pequeña. Genera momentum psicológico al ver deudas desaparecer más rápido.';
+  } else {
+    tipText.innerHTML = '<b>🔥 Avalanche:</b> Pagas primero la deuda con mayor interés. Matematicamente óptimo — pagas menos interés en total.';
+  }
+  tip.style.display = 'block';
+
+  // Render debt cards with projection
+  renderDebtCards(working);
+}
+
+function renderDebtCards(projections) {
+  const list = document.getElementById('plan-debt-list');
+  if (!debts.length) {
+    list.innerHTML = `<div class="card" style="text-align:center;padding:40px;color:var(--text3);">
+      <div style="font-size:32px;margin-bottom:8px;">🎯</div>
+      <div style="font-size:14px;">Sin deudas registradas. ¡Agrega la primera!</div>
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = debts.map((d, i) => {
+    const proj = projections ? projections.find(p => p.idx === i) : null;
+    const remaining = Math.max(0, d.balance - d.paid);
+    const pct = d.balance > 0 ? Math.min(100, Math.round((d.paid / d.balance) * 100)) : 0;
+    const done = remaining <= 0;
+    let timeLabel = '';
+    if (done) {
+      timeLabel = '<span style="background:#d0f5e8;color:#1a7a52;border-radius:999px;padding:3px 10px;font-size:11px;font-weight:700;">✓ Liquidada</span>';
+    } else if (proj?.monthsPaidOff) {
+      const m = proj.monthsPaidOff;
+      const yrs = Math.floor(m/12), mos = m%12;
+      const label = yrs > 0 ? `${yrs}a ${mos}m` : `${mos} mes${mos!==1?'es':''}`;
+      const col = m <= 6 ? '#1a7a52' : m <= 18 ? '#7a5a00' : '#7a1a1a';
+      const bg = m <= 6 ? '#d0f5e8' : m <= 18 ? '#fef3d0' : '#fde8ea';
+      timeLabel = `<span style="background:${bg};color:${col};border-radius:999px;padding:3px 10px;font-size:11px;font-weight:700;">⏱ ${label}</span>`;
+    }
+
+    return `<div class="card" style="padding:20px;border-left:4px solid ${d.color};">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+        <div>
+          <div style="font-size:15px;font-weight:800;color:var(--text);margin-bottom:4px;">${d.name}</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            ${timeLabel}
+            ${d.interest > 0 ? `<span style="font-size:11px;color:var(--text3);">${d.interest}% interés/mes</span>` : ''}
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div style="text-align:right;">
+            <div style="font-size:11px;color:var(--text3);">Restante</div>
+            <div style="font-size:20px;font-weight:900;color:${done?'var(--green)':'var(--red)'};">$${remaining.toLocaleString('es-MX')}</div>
+          </div>
+          <button onclick="openDebtModal(${i})" style="background:var(--bg);border:1px solid rgba(100,150,200,0.18);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;touch-action:manipulation;" title="Editar">✏️</button>
+          <button onclick="deleteDebt(${i})" style="background:#fde8ea;border:1px solid rgba(220,50,50,0.15);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;touch-action:manipulation;" title="Eliminar">🗑</button>
+        </div>
+      </div>
+
+      <div style="height:10px;background:rgba(100,150,200,0.12);border-radius:999px;overflow:hidden;margin-bottom:8px;">
+        <div style="height:100%;border-radius:999px;background:${d.color};width:${pct}%;transition:width .6s;"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text3);">
+        <span>$${d.paid.toLocaleString('es-MX')} pagado de $${d.balance.toLocaleString('es-MX')}</span>
+        <span>${pct}%</span>
+      </div>
+
+      <div style="display:flex;gap:16px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(100,150,200,0.08);flex-wrap:wrap;">
+        <div style="font-size:12px;color:var(--text2);">Pago mínimo: <b>$${d.minPay.toLocaleString('es-MX')}/mes</b></div>
+        <div>
+          <label style="font-size:11px;color:var(--text3);">Registrar abono: </label>
+          <input type="number" placeholder="$ monto" min="0" step="10"
+            style="width:90px;border:1px solid rgba(100,150,200,0.20);border-radius:7px;padding:3px 8px;font-size:12px;color:var(--text);background:var(--bg);outline:none;font-family:inherit;"
+            id="abono-${i}"
+            onfocus="this.style.borderColor='var(--accent)'"
+            onblur="this.style.borderColor='rgba(100,150,200,0.20)'">
+          <button onclick="registerAbono(${i})"
+            style="background:var(--green);color:white;border:none;border-radius:7px;padding:4px 10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;margin-left:4px;touch-action:manipulation;">
+            ✓
+          </button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function registerAbono(i) {
+  const input = document.getElementById('abono-' + i);
+  const amount = parseFloat(input?.value) || 0;
+  if (amount <= 0) return;
+  debts[i].paid = Math.min(debts[i].balance, debts[i].paid + amount);
+  S.set('fin_debts', debts);
+  input.value = '';
+  renderPlanView();
+  showToast('Abono de $' + amount.toLocaleString('es-MX') + ' registrado en ' + debts[i].name + ' ✓');
+}
+
+function renderPlanView() {
+  runPlanProjection();
+}
+
+</script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 :root {
@@ -220,6 +499,7 @@ nav { background: var(--surface); padding: 0 28px; height: 60px; display: flex; 
     <button onclick="switchView('tracker',this)">Gastos del mes</button>
     <button onclick="switchView('transactions',this)">Transacciones</button>
     <button onclick="switchView('budget',this)">Presupuesto</button>
+    <button onclick="switchView('plan',this)">Plan de acción</button>
   </div>
   <div style="display:flex;align-items:center;gap:10px;">
     <div class="avatar" id="user-avatar" onclick="editInitialsInline()" title="Modificar iniciales" style="cursor:pointer;user-select:none;">JW</div>
@@ -235,6 +515,7 @@ nav { background: var(--surface); padding: 0 28px; height: 60px; display: flex; 
   <button id="mm-tracker" onclick="switchView('tracker',null);closeMobileMenu()">📋 Gastos del mes</button>
   <button id="mm-transactions" onclick="switchView('transactions',null);closeMobileMenu()">💳 Transacciones</button>
   <button id="mm-budget" onclick="switchView('budget',null);closeMobileMenu()">📊 Presupuesto</button>
+  <button id="mm-plan" onclick="switchView('plan',null);closeMobileMenu()">🎯 Plan de acción</button>
   <div class="menu-divider"></div>
   <button onclick="editInitialsInline();closeMobileMenu()" style="color:var(--text2);font-size:13px;">✏️ Modificar iniciales</button>
 </div>
@@ -445,6 +726,70 @@ nav { background: var(--surface); padding: 0 28px; height: 60px; display: flex; 
       </div>
     </div>
   </div>
+</div>
+</div>
+
+<!-- PLAN DE ACCIÓN -->
+<div class="view" id="view-plan">
+<div class="main">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;">
+    <div>
+      <div class="section-title" style="margin-bottom:4px;">🎯 Plan de acción</div>
+      <div style="font-size:13px;color:var(--text2);">Proyección para liquidar tus deudas</div>
+    </div>
+    <button onclick="openModal('debt')" style="display:flex;align-items:center;gap:7px;background:var(--accent);color:white;border:none;border-radius:10px;padding:10px 18px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;touch-action:manipulation;">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1v11M1 6.5h11" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
+      Nueva deuda
+    </button>
+  </div>
+
+  <!-- CONFIG ROW -->
+  <div class="card" style="padding:18px;margin-bottom:18px;">
+    <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:flex-end;">
+      <div>
+        <div style="font-size:11px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">Disponible mensual para deudas</div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span style="font-size:14px;color:var(--text3);">$</span>
+          <input type="number" id="plan-monthly-budget" value="3000" min="0" step="100"
+            style="width:110px;border:1.5px solid rgba(100,150,200,0.20);border-radius:8px;padding:7px 10px;font-size:14px;font-weight:600;color:var(--text);background:var(--bg);outline:none;"
+            onfocus="this.style.borderColor='var(--accent)'"
+            onblur="this.style.borderColor='rgba(100,150,200,0.20)'"
+            oninput="runPlanProjection()">
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">Estrategia</div>
+        <div style="display:flex;background:var(--surface);border-radius:999px;padding:3px;gap:0;border:1px solid rgba(100,150,200,0.15);">
+          <button id="strat-snowball" onclick="setStrategy('snowball')"
+            style="padding:6px 14px;border-radius:999px;border:none;font-size:12px;font-weight:700;cursor:pointer;background:var(--accent);color:white;transition:all .2s;font-family:inherit;">
+            Snowball ❄️
+          </button>
+          <button id="strat-avalanche" onclick="setStrategy('avalanche')"
+            style="padding:6px 14px;border-radius:999px;border:none;font-size:12px;font-weight:500;cursor:pointer;background:transparent;color:var(--text2);transition:all .2s;font-family:inherit;">
+            Avalanche 🔥
+          </button>
+        </div>
+      </div>
+      <div id="plan-summary" style="margin-left:auto;text-align:right;">
+        <div style="font-size:11px;color:var(--text3);">Libre de deudas en</div>
+        <div style="font-size:22px;font-weight:900;color:var(--accent);" id="plan-months-total">—</div>
+      </div>
+    </div>
+    <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(100,150,200,0.10);display:flex;gap:24px;flex-wrap:wrap;">
+      <div><div style="font-size:11px;color:var(--text3);">Total deuda</div><div style="font-size:18px;font-weight:800;color:var(--red);" id="plan-total-debt">$0</div></div>
+      <div><div style="font-size:11px;color:var(--text3);">Pagado hasta hoy</div><div style="font-size:18px;font-weight:800;color:var(--green);" id="plan-total-paid">$0</div></div>
+      <div><div style="font-size:11px;color:var(--text3);">Restante</div><div style="font-size:18px;font-weight:800;color:var(--text);" id="plan-total-remaining">$0</div></div>
+    </div>
+  </div>
+
+  <!-- DEBT CARDS -->
+  <div id="plan-debt-list" style="display:flex;flex-direction:column;gap:16px;"></div>
+
+  <!-- STRATEGY EXPLANATION -->
+  <div id="plan-strategy-tip" class="card" style="margin-top:18px;padding:16px;background:var(--bg);box-shadow:none;border:1px solid rgba(100,150,200,0.12);display:none;">
+    <div style="font-size:13px;color:var(--text2);" id="plan-strategy-text"></div>
+  </div>
+
 </div>
 </div>
 
@@ -1454,6 +1799,7 @@ function switchView(view,btn) {
   });
   if(view==='transactions') renderFullTxns();
   if(view==='budget') renderBudgetTables();
+  if(view==='plan') renderPlanView();
 }
 
 function toggleMobileMenu() {
@@ -1500,6 +1846,8 @@ function openModal(type) {
     document.getElementById('modal-optional').classList.add('open');
   } else if(type==='budget'){
     document.getElementById('modal-budget').classList.add('open');
+  } else if(type==='debt'){
+    openDebtModal(null);
   } else if(type==='oblig-add'){
     editingObligIdx = null;
     document.getElementById('oblig-modal-title').textContent = 'Nuevo gasto obligatorio';
@@ -1529,7 +1877,287 @@ window.addEventListener('load',()=>{
   restoreIncomeUI();
   updateTrackerSummary();
   document.getElementById('tracker-month').textContent=new Date().toLocaleDateString('es-MX',{month:'long',year:'numeric'});
+  buildDebtColorSwatches();
 });
+
+// ============================================================
+// PLAN DE ACCIÓN
+// ============================================================
+const DEBT_COLORS = ['#e05c6a','#3b82f6','#2ecc8a','#f5a623','#aa88dd','#5b8fcc','#f09595','#7dd4aa'];
+let selectedDebtColor = DEBT_COLORS[0];
+let editingDebtIdx = null;
+let planStrategy = 'snowball';
+
+const DEFAULT_DEBTS = [
+  { name:'Didi', balance:1500, paid:0, minPay:300, interest:0, color:DEBT_COLORS[0] },
+  { name:'Plata', balance:2000, paid:0, minPay:400, interest:0, color:DEBT_COLORS[1] },
+  { name:'Stori', balance:4000, paid:0, minPay:500, interest:0, color:DEBT_COLORS[2] },
+];
+let debts = S.get('fin_debts', DEFAULT_DEBTS);
+
+function buildDebtColorSwatches() {
+  const wrap = document.getElementById('debt-color-swatches');
+  if (!wrap) return;
+  wrap.innerHTML = DEBT_COLORS.map((c,i) =>
+    `<div onclick="selectDebtColor('${c}')" style="width:24px;height:24px;border-radius:50%;background:${c};cursor:pointer;border:3px solid ${c===selectedDebtColor?'white':'transparent'};box-shadow:${c===selectedDebtColor?'0 0 0 2px '+c:'none'};transition:all .15s;"></div>`
+  ).join('');
+}
+
+function selectDebtColor(c) {
+  selectedDebtColor = c;
+  buildDebtColorSwatches();
+  updateDebtPreview();
+}
+
+function updateDebtPreview() {
+  const name = document.getElementById('debt-name')?.value || 'Nombre';
+  const balance = parseFloat(document.getElementById('debt-balance')?.value) || 0;
+  const paid = parseFloat(document.getElementById('debt-paid')?.value) || 0;
+  const pct = balance > 0 ? Math.min(100, Math.round((paid/balance)*100)) : 0;
+  document.getElementById('dp-name').textContent = name || 'Nombre';
+  document.getElementById('dp-balance').textContent = '$' + balance.toLocaleString('es-MX');
+  document.getElementById('dp-bar').style.width = pct + '%';
+  document.getElementById('dp-bar').style.background = selectedDebtColor;
+  document.getElementById('dp-paid-lbl').textContent = '$' + paid.toLocaleString('es-MX') + ' pagado';
+  document.getElementById('dp-pct').textContent = pct + '%';
+}
+
+function openDebtModal(idx = null) {
+  editingDebtIdx = idx;
+  const isEdit = idx !== null;
+  document.getElementById('debt-modal-title').textContent = isEdit ? 'Editar deuda' : 'Nueva deuda';
+  document.getElementById('debt-save-btn').textContent = isEdit ? 'Guardar' : 'Agregar';
+  if (isEdit) {
+    const d = debts[idx];
+    document.getElementById('debt-name').value = d.name;
+    document.getElementById('debt-balance').value = d.balance;
+    document.getElementById('debt-paid').value = d.paid;
+    document.getElementById('debt-minpay').value = d.minPay;
+    document.getElementById('debt-interest').value = d.interest || 0;
+    selectedDebtColor = d.color || DEBT_COLORS[0];
+  } else {
+    document.getElementById('debt-name').value = '';
+    document.getElementById('debt-balance').value = '';
+    document.getElementById('debt-paid').value = '';
+    document.getElementById('debt-minpay').value = '';
+    document.getElementById('debt-interest').value = '';
+    selectedDebtColor = DEBT_COLORS[debts.length % DEBT_COLORS.length];
+  }
+  buildDebtColorSwatches();
+  updateDebtPreview();
+  document.getElementById('modal-debt').classList.add('open');
+}
+
+function saveDebt() {
+  const name = document.getElementById('debt-name').value.trim();
+  const balance = parseFloat(document.getElementById('debt-balance').value) || 0;
+  const paid = parseFloat(document.getElementById('debt-paid').value) || 0;
+  const minPay = parseFloat(document.getElementById('debt-minpay').value) || 0;
+  const interest = parseFloat(document.getElementById('debt-interest').value) || 0;
+  if (!name || balance <= 0) { alert('Ingresa nombre y saldo'); return; }
+  const debt = { name, balance, paid, minPay, interest, color: selectedDebtColor };
+  if (editingDebtIdx !== null) { debts[editingDebtIdx] = debt; editingDebtIdx = null; }
+  else debts.push(debt);
+  S.set('fin_debts', debts);
+  closeModal('debt');
+  renderPlanView();
+}
+
+function deleteDebt(idx) {
+  if (!confirm('¿Eliminar "' + debts[idx].name + '"?')) return;
+  debts.splice(idx, 1);
+  S.set('fin_debts', debts);
+  renderPlanView();
+}
+
+function setStrategy(s) {
+  planStrategy = s;
+  const sb = document.getElementById('strat-snowball');
+  const av = document.getElementById('strat-avalanche');
+  if (s === 'snowball') {
+    sb.style.background='var(--accent)'; sb.style.color='white'; sb.style.fontWeight='700';
+    av.style.background='transparent'; av.style.color='var(--text2)'; av.style.fontWeight='500';
+  } else {
+    av.style.background='var(--accent)'; av.style.color='white'; av.style.fontWeight='700';
+    sb.style.background='transparent'; sb.style.color='var(--text2)'; sb.style.fontWeight='500';
+  }
+  runPlanProjection();
+}
+
+function runPlanProjection() {
+  if (!debts.length) return;
+  const monthlyBudget = parseFloat(document.getElementById('plan-monthly-budget')?.value) || 0;
+
+  // Work on copies with remaining balance
+  let working = debts.map((d,i) => ({
+    idx: i,
+    name: d.name,
+    remaining: Math.max(0, d.balance - d.paid),
+    minPay: d.minPay || 0,
+    interest: (d.interest || 0) / 100,
+    color: d.color,
+    paidOff: false,
+    monthsPaidOff: null,
+  }));
+
+  // Sort by strategy
+  if (planStrategy === 'snowball') {
+    working.sort((a,b) => a.remaining - b.remaining);
+  } else {
+    working.sort((a,b) => b.interest - a.interest);
+  }
+
+  let month = 0;
+  const maxMonths = 240; // 20 years cap
+  while (working.some(d => !d.paidOff) && month < maxMonths) {
+    month++;
+    // Available extra after minimums
+    let totalMin = working.filter(d=>!d.paidOff).reduce((s,d)=>s+d.minPay, 0);
+    let extra = Math.max(0, monthlyBudget - totalMin);
+
+    for (let d of working) {
+      if (d.paidOff) continue;
+      // Apply interest
+      d.remaining += d.remaining * d.interest;
+      // Pay minimum
+      let pay = Math.min(d.minPay, d.remaining);
+      d.remaining -= pay;
+      if (d.remaining <= 0) { d.remaining = 0; d.paidOff = true; d.monthsPaidOff = month; continue; }
+    }
+    // Apply extra to priority debt (first not paid off in sorted order)
+    const priority = working.find(d => !d.paidOff);
+    if (priority && extra > 0) {
+      priority.remaining = Math.max(0, priority.remaining - extra);
+      if (priority.remaining === 0) { priority.paidOff = true; priority.monthsPaidOff = month; }
+    }
+  }
+
+  // Update UI
+  const totalDebt = debts.reduce((s,d) => s + d.balance, 0);
+  const totalPaid = debts.reduce((s,d) => s + d.paid, 0);
+  const totalRemaining = debts.reduce((s,d) => s + Math.max(0, d.balance - d.paid), 0);
+
+  document.getElementById('plan-total-debt').textContent = '$' + totalDebt.toLocaleString('es-MX');
+  document.getElementById('plan-total-paid').textContent = '$' + totalPaid.toLocaleString('es-MX');
+  document.getElementById('plan-total-remaining').textContent = '$' + totalRemaining.toLocaleString('es-MX');
+
+  const maxMonth = Math.max(...working.map(d => d.monthsPaidOff || month));
+  const totalEl = document.getElementById('plan-months-total');
+  if (maxMonth >= maxMonths) {
+    totalEl.textContent = '+20 años';
+    totalEl.style.color = 'var(--red)';
+  } else if (maxMonth === 0) {
+    totalEl.textContent = '¡Listo!';
+    totalEl.style.color = 'var(--green)';
+  } else {
+    const yrs = Math.floor(maxMonth / 12);
+    const mos = maxMonth % 12;
+    totalEl.textContent = yrs > 0 ? `${yrs}a ${mos}m` : `${mos} mes${mos!==1?'es':''}`;
+    totalEl.style.color = maxMonth <= 6 ? 'var(--green)' : maxMonth <= 18 ? '#f5a623' : 'var(--red)';
+  }
+
+  // Strategy tip
+  const tip = document.getElementById('plan-strategy-tip');
+  const tipText = document.getElementById('plan-strategy-text');
+  if (planStrategy === 'snowball') {
+    tipText.innerHTML = '<b>❄️ Snowball:</b> Pagas primero la deuda más pequeña. Genera momentum psicológico al ver deudas desaparecer más rápido.';
+  } else {
+    tipText.innerHTML = '<b>🔥 Avalanche:</b> Pagas primero la deuda con mayor interés. Matematicamente óptimo — pagas menos interés en total.';
+  }
+  tip.style.display = 'block';
+
+  // Render debt cards with projection
+  renderDebtCards(working);
+}
+
+function renderDebtCards(projections) {
+  const list = document.getElementById('plan-debt-list');
+  if (!debts.length) {
+    list.innerHTML = `<div class="card" style="text-align:center;padding:40px;color:var(--text3);">
+      <div style="font-size:32px;margin-bottom:8px;">🎯</div>
+      <div style="font-size:14px;">Sin deudas registradas. ¡Agrega la primera!</div>
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = debts.map((d, i) => {
+    const proj = projections ? projections.find(p => p.idx === i) : null;
+    const remaining = Math.max(0, d.balance - d.paid);
+    const pct = d.balance > 0 ? Math.min(100, Math.round((d.paid / d.balance) * 100)) : 0;
+    const done = remaining <= 0;
+    let timeLabel = '';
+    if (done) {
+      timeLabel = '<span style="background:#d0f5e8;color:#1a7a52;border-radius:999px;padding:3px 10px;font-size:11px;font-weight:700;">✓ Liquidada</span>';
+    } else if (proj?.monthsPaidOff) {
+      const m = proj.monthsPaidOff;
+      const yrs = Math.floor(m/12), mos = m%12;
+      const label = yrs > 0 ? `${yrs}a ${mos}m` : `${mos} mes${mos!==1?'es':''}`;
+      const col = m <= 6 ? '#1a7a52' : m <= 18 ? '#7a5a00' : '#7a1a1a';
+      const bg = m <= 6 ? '#d0f5e8' : m <= 18 ? '#fef3d0' : '#fde8ea';
+      timeLabel = `<span style="background:${bg};color:${col};border-radius:999px;padding:3px 10px;font-size:11px;font-weight:700;">⏱ ${label}</span>`;
+    }
+
+    return `<div class="card" style="padding:20px;border-left:4px solid ${d.color};">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+        <div>
+          <div style="font-size:15px;font-weight:800;color:var(--text);margin-bottom:4px;">${d.name}</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            ${timeLabel}
+            ${d.interest > 0 ? `<span style="font-size:11px;color:var(--text3);">${d.interest}% interés/mes</span>` : ''}
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div style="text-align:right;">
+            <div style="font-size:11px;color:var(--text3);">Restante</div>
+            <div style="font-size:20px;font-weight:900;color:${done?'var(--green)':'var(--red)'};">$${remaining.toLocaleString('es-MX')}</div>
+          </div>
+          <button onclick="openDebtModal(${i})" style="background:var(--bg);border:1px solid rgba(100,150,200,0.18);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;touch-action:manipulation;" title="Editar">✏️</button>
+          <button onclick="deleteDebt(${i})" style="background:#fde8ea;border:1px solid rgba(220,50,50,0.15);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer;touch-action:manipulation;" title="Eliminar">🗑</button>
+        </div>
+      </div>
+
+      <div style="height:10px;background:rgba(100,150,200,0.12);border-radius:999px;overflow:hidden;margin-bottom:8px;">
+        <div style="height:100%;border-radius:999px;background:${d.color};width:${pct}%;transition:width .6s;"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text3);">
+        <span>$${d.paid.toLocaleString('es-MX')} pagado de $${d.balance.toLocaleString('es-MX')}</span>
+        <span>${pct}%</span>
+      </div>
+
+      <div style="display:flex;gap:16px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(100,150,200,0.08);flex-wrap:wrap;">
+        <div style="font-size:12px;color:var(--text2);">Pago mínimo: <b>$${d.minPay.toLocaleString('es-MX')}/mes</b></div>
+        <div>
+          <label style="font-size:11px;color:var(--text3);">Registrar abono: </label>
+          <input type="number" placeholder="$ monto" min="0" step="10"
+            style="width:90px;border:1px solid rgba(100,150,200,0.20);border-radius:7px;padding:3px 8px;font-size:12px;color:var(--text);background:var(--bg);outline:none;font-family:inherit;"
+            id="abono-${i}"
+            onfocus="this.style.borderColor='var(--accent)'"
+            onblur="this.style.borderColor='rgba(100,150,200,0.20)'">
+          <button onclick="registerAbono(${i})"
+            style="background:var(--green);color:white;border:none;border-radius:7px;padding:4px 10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;margin-left:4px;touch-action:manipulation;">
+            ✓
+          </button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function registerAbono(i) {
+  const input = document.getElementById('abono-' + i);
+  const amount = parseFloat(input?.value) || 0;
+  if (amount <= 0) return;
+  debts[i].paid = Math.min(debts[i].balance, debts[i].paid + amount);
+  S.set('fin_debts', debts);
+  input.value = '';
+  renderPlanView();
+  showToast('Abono de $' + amount.toLocaleString('es-MX') + ' registrado en ' + debts[i].name + ' ✓');
+}
+
+function renderPlanView() {
+  runPlanProjection();
+}
+
 </script>
 
 <!-- MODAL: GASTO OBLIGATORIO -->
@@ -1571,6 +2199,55 @@ window.addEventListener('load',()=>{
   <div class="modal-actions">
     <button class="btn-cancel" onclick="closeModal('budget')">Cancelar</button>
     <button class="btn-ok" id="budget-save-btn" onclick="saveBudgetRow()">Agregar</button>
+  </div>
+</div>
+</div>
+
+<!-- MODAL: DEUDA -->
+<div class="modal-bg" id="modal-debt">
+<div class="modal" style="width:380px;">
+  <h3 id="debt-modal-title">Nueva deuda</h3>
+  <div class="fg">
+    <label>Nombre (ej: Stori, Didi…)</label>
+    <input type="text" id="debt-name" placeholder="Ej: Stori">
+  </div>
+  <div class="fg">
+    <label>Saldo total ($)</label>
+    <input type="number" id="debt-balance" placeholder="4000" min="0" step="10" oninput="updateDebtPreview()">
+  </div>
+  <div class="fg">
+    <label>Ya pagado ($)</label>
+    <input type="number" id="debt-paid" placeholder="0" min="0" step="10" oninput="updateDebtPreview()">
+  </div>
+  <div class="fg">
+    <label>Pago mínimo mensual ($)</label>
+    <input type="number" id="debt-minpay" placeholder="200" min="0" step="10">
+  </div>
+  <div class="fg">
+    <label>Tasa de interés mensual (%) <span style="color:var(--text3);font-weight:400;">opcional</span></label>
+    <input type="number" id="debt-interest" placeholder="0" min="0" step="0.1" max="100">
+  </div>
+  <div class="fg">
+    <label>Color</label>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;" id="debt-color-swatches"></div>
+  </div>
+  <!-- Mini preview -->
+  <div id="debt-preview" style="background:var(--bg);border-radius:12px;padding:14px;margin-top:4px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <span style="font-size:13px;font-weight:700;" id="dp-name">Nombre</span>
+      <span style="font-size:13px;font-weight:800;color:var(--red);" id="dp-balance">$0</span>
+    </div>
+    <div style="height:8px;background:rgba(100,150,200,0.15);border-radius:999px;overflow:hidden;">
+      <div id="dp-bar" style="height:100%;border-radius:999px;background:var(--accent);width:0%;transition:width .3s;"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text3);margin-top:5px;">
+      <span id="dp-paid-lbl">$0 pagado</span>
+      <span id="dp-pct">0%</span>
+    </div>
+  </div>
+  <div class="modal-actions">
+    <button class="btn-cancel" onclick="closeModal('debt')">Cancelar</button>
+    <button class="btn-ok" id="debt-save-btn" onclick="saveDebt()">Agregar</button>
   </div>
 </div>
 </div>
